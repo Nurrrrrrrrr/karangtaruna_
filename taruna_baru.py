@@ -4,16 +4,12 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, r2_score
 from scipy.stats import ttest_ind
 from datetime import datetime
 import io
 import warnings
 warnings.filterwarnings('ignore')
-
-# --- Import khusus untuk LSTM ---
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
 
 st.set_page_config(
     page_title="Dashboard Keuangan Karang Taruna",
@@ -598,128 +594,115 @@ def deteksi_anomali(monthly: pd.DataFrame) -> list:
     return anomali
 
 # ============================================================
-# PREDIKSI LSTM (INTEGRASI BARU)
+# PREDIKSI
 # ============================================================
 
-@st.cache_data(show_spinner="🧠 Model LSTM sedang melatih dan mempelajari pola harian data Anda...")
-def prediksi_lstm(df_asli: pd.DataFrame, last_bln: int, tahun: int, last_sal: float) -> dict:
-    """Fungsi Prediksi menggunakan Deep Learning LSTM berbasis Data Harian"""
-    
-    # 1. Konversi ke data harian agar jumlah baris cukup untuk training LSTM
-    df_harian = df_asli.groupby('Tanggal')[['Pemasukan', 'Pengeluaran']].sum().reset_index()
-    df_harian.set_index('Tanggal', inplace=True)
-    
-    # Isi tanggal yang bolong dengan nilai 0 agar berurutan (Time-Series requirement)
-    idx = pd.date_range(df_harian.index.min(), df_harian.index.max())
-    df_harian = df_harian.reindex(idx, fill_value=0)
-    
-    data = df_harian[['Pemasukan', 'Pengeluaran']].values
-    n_data = len(data)
-    
-    TIME_STEPS = 30
-    
-    # HELPER untuk nama bulan
+def _exp_smoothing(values, alpha=0.45):
+    if not values: return 0.0
+    s = float(values[0])
+    for v in values[1:]: s = alpha * float(v) + (1 - alpha) * s
+    return s
+
+def _holt_smoothing(values, alpha=0.5, beta=0.3, periods_ahead=3):
+    n = len(values)
+    if n < 2: return [values[-1]] * periods_ahead, list(values), [0.0] * n, list(values)
+    L = [float(values[0])]; T = [float(values[1]) - float(values[0])]; fitted = [L[0] + T[0]]
+    for i in range(1, n):
+        v = float(values[i]); L_prev, T_prev = L[-1], T[-1]
+        L_new = alpha * v + (1 - alpha) * (L_prev + T_prev)
+        T_new = beta  * (L_new - L_prev) + (1 - beta) * T_prev
+        L.append(L_new); T.append(T_new)
+        if i < n - 1: fitted.append(L_new + T_new)
+    forecasts = [max(0.0, L[-1] + h * T[-1]) for h in range(1, periods_ahead + 1)]
+    return forecasts, L, T, fitted
+
+def _mape(actual, predicted):
+    a, p = np.array(actual, dtype=float), np.array(predicted, dtype=float)
+    mask = a != 0
+    if mask.sum() == 0: return 100.0
+    return float(np.mean(np.abs((a[mask] - p[mask]) / a[mask])) * 100)
+
+def prediksi(monthly: pd.DataFrame, tahun: int) -> dict:
+    n = len(monthly); avg_pem = float(monthly['Pemasukan'].mean()); avg_pen = float(monthly['Pengeluaran'].mean())
+    last_sal = float(monthly['SaldoAkhir'].iloc[-1]); last_bln = int(monthly['Bulan'].iloc[-1])
+    next_bln = (last_bln % 12) + 1; next_thn = tahun if last_bln < 12 else tahun + 1
+    pem_vals = monthly['Pemasukan'].values.tolist(); pen_vals = monthly['Pengeluaran'].values.tolist()
+    mae_pem = mae_pen = r2_pem = r2_pen = mape_pem = mape_pen = 0.0
+    ci_pem_80 = ci_pen_80 = ci_pem_95 = ci_pen_95 = 0.0
+    forecast_pem = forecast_pen = []; conf = "Rendah"; model_name = "—"
+
+    if n < 2:
+        pred_pem, pred_pen = avg_pem, avg_pen; forecast_pem = [avg_pem]*3; forecast_pen = [avg_pen]*3; model_name = "Rata-rata"
+    elif n < 4:
+        weights = np.arange(1, n+1, dtype=float)
+        wma_pem = float(np.average(pem_vals, weights=weights)); wma_pen = float(np.average(pen_vals, weights=weights))
+        ets_pem = _exp_smoothing(pem_vals); ets_pen = _exp_smoothing(pen_vals)
+        pred_pem = max(0.0, 0.60*ets_pem + 0.40*wma_pem); pred_pen = max(0.0, 0.60*ets_pen + 0.40*wma_pen)
+        forecast_pem = [pred_pem]*3; forecast_pen = [pred_pen]*3; model_name = "WMA + ETS"
+    else:
+        best_err = float('inf'); best_ap, best_bp, best_ae, best_be = 0.5, 0.3, 0.5, 0.3
+        for ap in [0.2,0.35,0.5,0.65,0.8]:
+            for bp in [0.1,0.2,0.3,0.4]:
+                _, _, _, fitted_p = _holt_smoothing(pem_vals, ap, bp)
+                if not fitted_p: continue
+                ml = min(len(pem_vals)-1, len(fitted_p))
+                err = np.mean(np.abs(np.array(pem_vals[1:ml+1]) - np.array(fitted_p[:ml])))
+                if err < best_err: best_err = err; best_ap, best_bp = ap, bp
+        best_err = float('inf')
+        for ae in [0.2,0.35,0.5,0.65,0.8]:
+            for be in [0.1,0.2,0.3,0.4]:
+                _, _, _, fitted_e = _holt_smoothing(pen_vals, ae, be)
+                if not fitted_e: continue
+                ml = min(len(pen_vals)-1, len(fitted_e))
+                err = np.mean(np.abs(np.array(pen_vals[1:ml+1]) - np.array(fitted_e[:ml])))
+                if err < best_err: best_err = err; best_ae, best_be = ae, be
+        fc_pem, Lp, Tp, fitted_p = _holt_smoothing(pem_vals, best_ap, best_bp, 3)
+        fc_pen, Le, Te, fitted_e = _holt_smoothing(pen_vals, best_ae, best_be, 3)
+        pred_pem = fc_pem[0]; pred_pen = fc_pen[0]; forecast_pem = fc_pem; forecast_pen = fc_pen
+        res_p = np.array(pem_vals[1:]) - np.array([Lp[i]+Tp[i] for i in range(min(len(Lp),len(pem_vals))-1)])
+        res_e = np.array(pen_vals[1:]) - np.array([Le[i]+Te[i] for i in range(min(len(Le),len(pen_vals))-1)])
+        std_p = float(np.std(res_p)) if len(res_p) > 0 else avg_pem * 0.1
+        std_e = float(np.std(res_e)) if len(res_e) > 0 else avg_pen * 0.1
+        ci_pem_80 = 1.28*std_p; ci_pem_95 = 1.96*std_p; ci_pen_80 = 1.28*std_e; ci_pen_95 = 1.96*std_e
+        xs = np.arange(1, n+1, dtype=float).reshape(-1,1); sp = max(2, int(n*0.75))
+        if sp < n:
+            m_p = LinearRegression().fit(xs[:sp], pem_vals[:sp]); m_e = LinearRegression().fit(xs[:sp], pen_vals[:sp])
+            mae_pem = mean_absolute_error(pem_vals[sp:], m_p.predict(xs[sp:]))
+            mae_pen = mean_absolute_error(pen_vals[sp:], m_e.predict(xs[sp:]))
+        m_p_full = LinearRegression().fit(xs, pem_vals); m_e_full = LinearRegression().fit(xs, pen_vals)
+        r2_pem = max(0.0, r2_score(pem_vals, m_p_full.predict(xs))); r2_pen = max(0.0, r2_score(pen_vals, m_e_full.predict(xs)))
+        ml_p = min(len(pem_vals)-1, len(fitted_p)); ml_e = min(len(pen_vals)-1, len(fitted_e))
+        if ml_p > 0: mape_pem = _mape(pem_vals[1:ml_p+1], fitted_p[:ml_p])
+        if ml_e > 0: mape_pen = _mape(pen_vals[1:ml_e+1], fitted_e[:ml_e])
+        avg_r2 = (r2_pem+r2_pen)/2; cv_pem = (monthly['Pemasukan'].std()/avg_pem*100) if avg_pem > 0 else 100
+        avg_mape = (mape_pem+mape_pen)/2
+        if avg_r2 >= 0.80 and cv_pem < 20 and avg_mape < 15: conf = "Tinggi"
+        elif avg_r2 >= 0.50 or cv_pem < 40 or avg_mape < 30: conf = "Sedang"
+        else: conf = "Rendah"
+        model_name = f"Holt's DES (α={best_ap}, β={best_bp})"
+
     def next_month_name(base_bln, offset):
         bln = ((base_bln - 1 + offset) % 12) + 1
-        thn = tahun + (base_bln - 1 + offset) // 12
+        thn = tahun + (last_bln - 1 + offset) // 12 - (last_bln - 1) // 12
+        if last_bln == 12 and offset > 0: thn = tahun + (offset - 1) // 12 + 1
         return MONTH_ID[bln], bln
 
     fc3 = []
-    avg_pem_hist = df_harian['Pemasukan'].mean() * 30 
-    avg_pen_hist = df_harian['Pengeluaran'].mean() * 30
-
-    # FALLBACK: Jika data terlalu sedikit (< 45 hari), LSTM tidak akan bekerja optimal
-    if n_data <= 45:
-        saldo_accum = last_sal
-        for i in range(3):
-            sur = avg_pem_hist - avg_pen_hist
-            saldo_accum += sur
-            bn_nama, bn_num = next_month_name(last_bln, i+1)
-            fc3.append({
-                'bulan': bn_nama, 'bulan_num': bn_num,
-                'pemasukan': round(avg_pem_hist), 'pengeluaran': round(avg_pen_hist),
-                'surplus': round(sur), 'saldo_akhir': round(saldo_accum),
-                'ci_pem_80': round(avg_pem_hist * 0.15), 'ci_pen_80': round(avg_pen_hist * 0.15)
-            })
-        return {
-            'pemasukan': fc3[0]['pemasukan'], 'pengeluaran': fc3[0]['pengeluaran'],
-            'surplus': fc3[0]['surplus'], 'saldo': fc3[0]['saldo_akhir'],
-            'bulan_nama': fc3[0]['bulan'], 'tahun': tahun if fc3[0]['bulan_num'] > last_bln else tahun + 1,
-            'confidence': "Rendah (Data Terbatas)", 'model': "Rata-rata Historis (Data LSTM kurang)",
-            'n_bulan': max(1, n_data // 30), 'avg_pem': avg_pem_hist, 'avg_pen': avg_pen_hist,
-            'forecast_3bln': fc3
-        }
-
-    # 2. Scaling Data
-    scaler = MinMaxScaler()
-    data_scaled = scaler.fit_transform(data)
-    
-    # 3. Membuat Sequences (X) dan Target (y)
-    X, y = [], []
-    for i in range(len(data_scaled) - TIME_STEPS):
-        X.append(data_scaled[i:i+TIME_STEPS])
-        y.append(data_scaled[i+TIME_STEPS])
-    X, y = np.array(X), np.array(y)
-    
-    # 4. Bangun Arsitektur LSTM (Ringan & Cepat untuk Dashboard)
-    model = Sequential([
-        LSTM(32, input_shape=(TIME_STEPS, 2)),
-        Dense(2)
-    ])
-    model.compile(optimizer='adam', loss='mse')
-    
-    # 5. Training
-    model.fit(X, y, epochs=30, batch_size=16, verbose=0)
-    
-    # 6. Prediksi Iteratif untuk 90 Hari ke Depan (3 Bulan)
-    future_preds = []
-    curr_batch = data_scaled[-TIME_STEPS:].reshape(1, TIME_STEPS, 2)
-    
-    for _ in range(90):
-        p = model.predict(curr_batch, verbose=0)
-        future_preds.append(p[0])
-        # Update batch: geser data, masukkan hasil prediksi terbaru
-        curr_batch = np.append(curr_batch[:, 1:, :], [p], axis=1)
-        
-    # 7. Kembalikan Skala Nilai (Inverse Transform)
-    future_rp = scaler.inverse_transform(future_preds)
-    
-    # Hindari nilai negatif dari output NN
-    future_pem = np.maximum(0, future_rp[:, 0])
-    future_pen = np.maximum(0, future_rp[:, 1])
-    
-    # 8. Agregasikan Prediksi Harian ke format Bulanan (3 Bulan)
-    saldo_accum = last_sal
     for i in range(3):
-        # Ambil potongan 30 hari untuk tiap bulan
-        p_val = future_pem[i*30:(i+1)*30].sum()
-        e_val = future_pen[i*30:(i+1)*30].sum()
-        sur = p_val - e_val
-        saldo_accum += sur
         bn_nama, bn_num = next_month_name(last_bln, i+1)
-        
-        fc3.append({
-            'bulan': bn_nama, 'bulan_num': bn_num,
-            'pemasukan': round(p_val), 'pengeluaran': round(e_val),
-            'surplus': round(sur), 'saldo_akhir': round(saldo_accum),
-            'ci_pem_80': round(p_val * 0.12), # Rentang simpangan
-            'ci_pen_80': round(e_val * 0.12)
-        })
-
-    return {
-        'pemasukan': fc3[0]['pemasukan'],
-        'pengeluaran': fc3[0]['pengeluaran'],
-        'surplus': fc3[0]['surplus'],
-        'saldo': fc3[0]['saldo_akhir'],
-        'bulan_nama': fc3[0]['bulan'],
-        'tahun': tahun if fc3[0]['bulan_num'] > last_bln else tahun + 1,
-        'confidence': "Tinggi" if n_data >= 180 else "Sedang",
-        'model': "LSTM (Long Short-Term Memory)",
-        'n_bulan': n_data // 30,
-        'avg_pem': avg_pem_hist,
-        'avg_pen': avg_pen_hist,
-        'forecast_3bln': fc3
-    }
+        fp = forecast_pem[i] if i < len(forecast_pem) else pred_pem
+        fe = forecast_pen[i] if i < len(forecast_pen) else pred_pen
+        ci_p = ci_pem_80 * ((i+1)**0.5); ci_e = ci_pen_80 * ((i+1)**0.5)
+        fc3.append({'bulan': bn_nama, 'bulan_num': bn_num, 'pemasukan': round(fp), 'pengeluaran': round(fe),
+                    'surplus': round(fp - fe), 'ci_pem_80': round(ci_p), 'ci_pen_80': round(ci_e)})
+    return {'pemasukan': round(pred_pem), 'pengeluaran': round(pred_pen),
+            'surplus': round(pred_pem - pred_pen), 'saldo': round(last_sal + pred_pem - pred_pen),
+            'bulan_nama': fc3[0]['bulan'] if fc3 else MONTH_ID[next_bln], 'tahun': next_thn,
+            'confidence': conf, 'model': model_name, 'mae_pem': mae_pem, 'mae_pen': mae_pen,
+            'mape_pem': mape_pem, 'mape_pen': mape_pen, 'r2_pem': r2_pem, 'r2_pen': r2_pen,
+            'avg_pem': avg_pem, 'avg_pen': avg_pen, 'n_bulan': n,
+            'ci_pem_80': ci_pem_80, 'ci_pem_95': ci_pem_95, 'ci_pen_80': ci_pen_80, 'ci_pen_95': ci_pen_95,
+            'forecast_3bln': fc3}
 
 # ============================================================
 # HEALTH SCORE
@@ -896,7 +879,7 @@ def render_welcome():
             <div class="step-item">
                 <div class="step-num">3</div>
                 <div class="step-title">Lihat Hasilnya</div>
-                <div class="step-desc">Grafik, prediksi 3 bulan dengan LSTM, dan saran keuangan tampil otomatis.</div>
+                <div class="step-desc">Grafik, prediksi 3 bulan, dan saran keuangan tampil otomatis.</div>
             </div>
         </div>
     </div>
@@ -925,7 +908,7 @@ def render_kpi(monthly, pred):
     ti = monthly['Pemasukan'].sum(); to = monthly['Pengeluaran'].sum()
     sur = ti - to; sal = monthly['SaldoAkhir'].iloc[-1]; pct = (sur / ti * 100) if ti > 0 else 0.0
     _sur_clr = CLR_GREEN if sur >= 0 else CLR_RED
-    # ── SVG helpers ──────────────
+    # ── SVG helpers (stroke-width 1.8, 26×26, Feather-style) ──────────────
     def _svg(stroke, paths):
         return (f'<svg xmlns="http://www.w3.org/2000/svg" width="26" height="26" '
                 f'viewBox="0 0 24 24" fill="none" stroke="{stroke}" '
@@ -999,8 +982,8 @@ def render_prediksi(pred, monthly):
         <div class="pred-box-title">Prediksi Keuangan — {pred['bulan_nama']} {pred['tahun']}</div>
         <div class="pred-box-sub">
             Model: <strong>{pred['model']}</strong> &nbsp;·&nbsp;
-            Data Historis: {pred['n_bulan']} bulan &nbsp;·&nbsp;
-            Kepercayaan LSTM: <strong>{pred['confidence']}</strong>
+            Data: {pred['n_bulan']} bulan &nbsp;·&nbsp;
+            Kepercayaan: <strong>{pred['confidence']}</strong>
         </div>
         <div class="pred-grid">
             <div class="pred-item">
@@ -1028,7 +1011,7 @@ def render_prediksi(pred, monthly):
     """, unsafe_allow_html=True)
 
     if pred['n_bulan'] < 3:
-        st.warning(f"Data hanya {pred['n_bulan']} bulan — model LSTM bekerja lebih baik dengan data yang panjang. Jika kurang, maka digunakan nilai rata-rata biasa.")
+        st.warning(f"Data hanya {pred['n_bulan']} bulan — prediksi masih kasar. Semakin banyak data, prediksi semakin akurat.")
 
     st.markdown('<div class="section-title">Perkiraan 3 Bulan ke Depan</div>', unsafe_allow_html=True)
     fc3 = pred.get('forecast_3bln', [])
@@ -1046,7 +1029,7 @@ def render_prediksi(pred, monthly):
                         Keluar: {rupiah(fc['pengeluaran'],True)}
                     </div>
                     <div class="kpi-delta" style="color:#8090B5; font-size:0.60rem; margin-top:5px;">
-                        ± {rupiah(ci_p, True)} (rentang error)
+                        ± {rupiah(ci_p, True)} (rentang 80%)
                     </div>
                 </div>""", unsafe_allow_html=True)
 
@@ -1064,7 +1047,7 @@ def render_prediksi(pred, monthly):
         Prediksi <strong>Saldo Akhir</strong>: <strong>{rupiah(pred['saldo'])}</strong><br>
         Kepercayaan Model: <strong>{pred['confidence']}</strong>
         <div style="margin-top:14px;padding-top:10px;border-top:1px dashed #C9D6EE;font-size:0.76rem;color:#6B7A99;">
-            Prediksi ini diekstraksi dari model LSTM berbasis data harian Anda.
+            Ini perkiraan berbasis tren historis. Tetap catat semua transaksi agar prediksi semakin akurat.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1155,7 +1138,7 @@ def chart_forecast(monthly, pred):
     fig = make_subplots(rows=1, cols=2, subplot_titles=("Forecast Pemasukan","Forecast Pengeluaran"), horizontal_spacing=0.12)
     fig.add_trace(go.Scatter(x=hist_x, y=hist_p, name='Aktual Pemasukan', line=dict(color=CLR_NAVY, width=2.5), marker=dict(size=7), mode='lines+markers', hovertemplate='%{x}: Rp %{y:,.0f}<extra></extra>'), row=1, col=1)
     fig.add_trace(go.Scatter(x=fc_x, y=ci_p_hi, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=fc_x, y=ci_p_lo, name='Rentang Prediksi', mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(27,58,107,0.18)', showlegend=True, hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=fc_x, y=ci_p_lo, name='Rentang Prediksi (80%)', mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(27,58,107,0.18)', showlegend=True, hoverinfo='skip'), row=1, col=1)
     fig.add_trace(go.Scatter(x=fc_x, y=fc_p, name='Forecast Pemasukan', mode='lines+markers', line=dict(color=CLR_NAVY, width=2, dash='dot'), marker=dict(size=9, symbol='diamond', color=CLR_NAVY), hovertemplate='%{x}: Rp %{y:,.0f}<extra></extra>'), row=1, col=1)
     fig.add_trace(go.Scatter(x=hist_x, y=hist_e, name='Aktual Pengeluaran', line=dict(color=CLR_GOLD, width=2.5), marker=dict(size=7), mode='lines+markers', hovertemplate='%{x}: Rp %{y:,.0f}<extra></extra>'), row=1, col=2)
     fig.add_trace(go.Scatter(x=fc_x, y=ci_e_hi, mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'), row=1, col=2)
@@ -1176,11 +1159,11 @@ def chart_akurasi(monthly):
     mp = LinearRegression().fit(xs[:sp], monthly['Pemasukan'].values[:sp])
     me = LinearRegression().fit(xs[:sp], monthly['Pengeluaran'].values[:sp])
     pp = mp.predict(xs[sp:]); pe = me.predict(xs[sp:]); xl = monthly['BulanNama'].values[sp:]
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("Akurasi Historis Pemasukan","Akurasi Historis Pengeluaran"))
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Akurasi Prediksi Pemasukan","Akurasi Prediksi Pengeluaran"))
     for col_idx, (actuals, preds, clr, name) in enumerate([(monthly['Pemasukan'].values[sp:], pp, CLR_NAVY, 'Pemasukan'),(monthly['Pengeluaran'].values[sp:], pe, CLR_GOLD, 'Pengeluaran')], 1):
         fig.add_trace(go.Scatter(x=xl, y=actuals, name=f'Aktual {name}', line=dict(color=clr, width=2.5), marker=dict(size=8), mode='lines+markers', showlegend=(col_idx==1)), row=1, col=col_idx)
         fig.add_trace(go.Scatter(x=xl, y=preds, name=f'Prediksi Linear {name}', line=dict(color=clr, width=2.5, dash='dot'), marker=dict(size=8, symbol='diamond'), showlegend=(col_idx==1)), row=1, col=col_idx)
-    fig.update_layout(title=dict(text="Akurasi Historis: Data Nyata vs Perkiraan Tren", font=dict(size=13, color=CLR_DARK)),
+    fig.update_layout(title=dict(text="Akurasi Prediksi: Data Nyata vs Perkiraan", font=dict(size=13, color=CLR_DARK)),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family="Poppins, sans-serif", size=11, color="#1A2D5A"),
         margin=dict(l=12,r=12,t=80,b=80), legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center", bgcolor="rgba(255,255,255,0.90)", bordercolor="#DDE3EF", borderwidth=1, font=dict(size=10)))
     for ann in fig.layout.annotations: ann.update(y=ann.y-0.04, font=dict(size=11, color="#1A2D5A"))
@@ -1328,15 +1311,15 @@ def render_tips(monthly, pred):
             'isi':f'Pengeluaran hanya {r*100:.0f}% dari pemasukan. Pertahankan pola ini dan pertimbangkan menyisihkan sebagian untuk kegiatan produktif desa.'})
     if sur < 0:
         tips.append({'badge':'!','w':CLR_RED,'judul':f'Waspadai Bulan {pred["bulan_nama"]}',
-            'isi':f'Prediksi LSTM bulan depan: pengeluaran diproyeksikan lebih besar dari pemasukan. Siapkan dana cadangan dari sekarang.'})
+            'isi':f'Prediksi bulan depan: pengeluaran lebih besar dari pemasukan (defisit ≈ {rupiah(abs(sur),True)}). Siapkan dana cadangan dari sekarang.'})
     else:
         tips.append({'badge':'OK','w':CLR_GREEN,'judul':f'Proyeksi Bulan {pred["bulan_nama"]} Positif',
-            'isi':f'Berdasarkan LSTM, perkiraan surplus ≈ {rupiah(sur,True)} bulan depan. Manfaatkan untuk menambah tabungan atau kegiatan sosial.'})
+            'isi':f'Perkiraan surplus ≈ {rupiah(sur,True)} bulan depan. Manfaatkan untuk menambah tabungan atau kegiatan sosial bagi warga desa.'})
     best = monthly.loc[monthly['Pemasukan'].idxmax()]
     tips.append({'badge':'#1','w':CLR_NAVY,'judul':f'Bulan Terkuat: {best["BulanNama"]}',
         'isi':f'Pemasukan tertinggi di bulan {best["BulanNama"]} ({rupiah(best["Pemasukan"],True)}). Jadwalkan kegiatan atau pembelian penting saat kas sedang penuh.'})
     tips.append({'badge':'N','w':CLR_GREEN,'judul':'Selalu Catat Setiap Transaksi',
-        'isi':'Model Artificial Intelligence (LSTM) yang bekerja di latar belakang sangat bergantung pada data harian. Catat semua transaksi Anda agar AI dapat memprediksi dengan akurat.'})
+        'isi':'Catat semua pemasukan dan pengeluaran tepat waktu dengan tanggal yang benar. Rekap mingguan membantu agar tidak ada yang terlewat dan laporan selalu akurat.'})
     cols = st.columns(2)
     for i, t in enumerate(tips):
         with cols[i % 2]:
@@ -1375,12 +1358,12 @@ def render_akurasi(monthly, pred):
     fig_ak = chart_akurasi(monthly)
     if fig_ak: st.plotly_chart(fig_ak, use_container_width=True)
     conf = pred.get('confidence', 'Rendah'); model = pred.get('model', '—'); n_bulan = pred.get('n_bulan', 0)
-    if 'Tinggi' in conf: clr_conf = "#27AE60"; pesan_conf = "Model LSTM telah mempelajari banyak data harian Anda."
-    elif 'Sedang' in conf: clr_conf = "#F39C12"; pesan_conf = "Model LSTM cukup bisa diandalkan, namun bisa sedikit meleset karena data masih kurang dari 6 bulan."
-    else: clr_conf = "#E74C3C"; pesan_conf = "Prediksi masih kasar. Kumpulkan lebih banyak data transaksi harian agar LSTM bisa bekerja optimal."
+    if 'Tinggi' in conf: clr_conf = "#27AE60"; pesan_conf = "Prediksi sangat bisa diandalkan."
+    elif 'Sedang' in conf: clr_conf = "#F39C12"; pesan_conf = "Prediksi cukup bisa diandalkan, namun bisa sedikit meleset."
+    else: clr_conf = "#E74C3C"; pesan_conf = "Prediksi masih kasar karena data belum cukup banyak."
     st.markdown(f"""
     <div style="background:white;border-radius:16px;padding:22px 24px;box-shadow:0 3px 14px rgba(27,58,107,0.09);border-left:5px solid #1B3A6B;margin-top:10px;">
-        <div style="font-size:0.94rem;font-weight:800;color:#1B3A6B;margin-bottom:16px;">Seberapa Akurat Prediksi LSTM Ini?</div>
+        <div style="font-size:0.94rem;font-weight:800;color:#1B3A6B;margin-bottom:16px;">Seberapa Akurat Prediksi Ini?</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;">
             <div style="background:#EEF3FB;border-radius:12px;padding:16px;text-align:center;">
                 <div style="width:14px;height:14px;border-radius:50%;background:{clr_conf};margin:0 auto 10px;"></div>
@@ -1388,9 +1371,9 @@ def render_akurasi(monthly, pred):
                 <div style="font-size:0.92rem;font-weight:900;color:#1B3A6B;">{conf}</div>
             </div>
             <div style="background:#EEF3FB;border-radius:12px;padding:16px;text-align:center;">
-                <div style="font-size:1.3rem;font-weight:800;color:#1B3A6B;margin-bottom:6px;">{n_bulan * 30}</div>
-                <div style="font-size:0.72rem;font-weight:700;color:#8090B5;margin-bottom:4px;">Row Transaksi Dipelajari</div>
-                <div style="font-size:0.92rem;font-weight:900;color:#1B3A6B;">Data Harian</div>
+                <div style="font-size:1.3rem;font-weight:800;color:#1B3A6B;margin-bottom:6px;">{n_bulan}</div>
+                <div style="font-size:0.72rem;font-weight:700;color:#8090B5;margin-bottom:4px;">Jumlah Data</div>
+                <div style="font-size:0.92rem;font-weight:900;color:#1B3A6B;">bulan</div>
             </div>
             <div style="background:#EEF3FB;border-radius:12px;padding:16px;text-align:center;">
                 <div style="font-size:0.65rem;font-weight:800;color:#1B3A6B;margin-bottom:6px;word-break:break-all;">{model}</div>
@@ -1398,8 +1381,8 @@ def render_akurasi(monthly, pred):
             </div>
         </div>
         <div style="margin-top:16px;background:#EEF3FB;border-radius:12px;padding:14px 18px;font-size:0.82rem;color:#1A2D5A;line-height:1.75;">
-            <strong>Cara membaca grafik di atas:</strong> Garis <em>penuh</em> adalah data nyata, garis <em>putus-putus</em> adalah tren.<br><br>
-            <span style="color:{clr_conf};font-weight:700;">{pesan_conf}</span> 
+            <strong>Cara membaca grafik:</strong> Garis <em>penuh</em> adalah data nyata, garis <em>putus-putus</em> adalah prediksi. Semakin berdekatan kedua garis, semakin akurat modelnya.<br><br>
+            <span style="color:{clr_conf};font-weight:700;">{pesan_conf}</span> Semakin banyak data yang dicatat setiap bulan, prediksi semakin mendekati kenyataan.
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -1482,7 +1465,6 @@ def main():
     tahun_list  = sorted(df['Tahun'].unique(), reverse=True)
     tahun_aktif = tahun_sel if (tahun_sel and tahun_sel in tahun_list) else tahun_list[0]
     monthly     = agregasi_bulanan(df, tahun_aktif)
-    
     if monthly.empty:
         st.warning(f"Tidak ada data untuk tahun {tahun_aktif}."); return
 
@@ -1495,11 +1477,7 @@ def main():
         else: monthly_filtered = monthly
     else: monthly_filtered = monthly
 
-    # --- EKSEKUSI LSTM ---
-    # Membutuhkan data full 'df' untuk training harian, dan butuh info bulan & saldo terakhir.
-    last_bln = int(monthly['Bulan'].iloc[-1])
-    last_sal = float(monthly['SaldoAkhir'].iloc[-1])
-    pred = prediksi_lstm(df, last_bln, tahun_aktif, last_sal)
+    pred = prediksi(monthly, tahun_aktif)
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["Ringkasan", "Grafik", "Prediksi", "Detail", "Tips & Saran"])
 
